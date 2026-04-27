@@ -2,11 +2,18 @@
  * Network Layer - Movie Collection Manager
  *
  * WebSocket server (hub for all connected clients) and WebSocket client
- * (used by the desktop GUI) built on Boost.Beast and Boost.Asio.
+ * (used by the desktop GUI) built on IXWebSocket. No TLS required.
  *
- * Strictly structural: no classes, no member functions. Sessions, clients
- * and server state are plain structs shared via std::shared_ptr where
- * required for asynchronous lifetime management.
+ * Strictly structural: no classes, no member functions. All state lives
+ * in plain structs; IXWebSocket internals are stored via std::unique_ptr
+ * to satisfy forward-declaration requirements, never subclassed.
+ *
+ * Thread-safety contract:
+ *   - IXWebSocket drives its own I/O threads.  Callbacks run on those
+ *     threads, so any field touched by both a callback and the main
+ *     thread must be protected by a mutex or be std::atomic.
+ *   - The data::Collection inside Server is protected by its own internal
+ *     mutex (see data.h).
  */
 #ifndef MCM_NETWORK_H
 #define MCM_NETWORK_H
@@ -15,17 +22,15 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
-#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/beast/core/tcp_stream.hpp>
-#include <boost/beast/websocket.hpp>
+#include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketServer.h>
 
 #include "data.h"
 #include "protocol.h"
@@ -33,32 +38,27 @@
 namespace mcm::network {
 
 /**
- * Session - per-client connection record on the server side.
- * Owned via std::shared_ptr so the reader thread may keep it alive.
- */
-struct Session {
-    std::uint64_t id = 0;
-    std::unique_ptr<boost::beast::websocket::stream<boost::beast::tcp_stream>> stream;
-    std::thread readerThread;
-    std::mutex writeMutex;
-    std::atomic<bool> alive{true};
-};
-
-/**
- * Server - WebSocket server state. Holds the canonical collection and
- * the set of live sessions. All mutation is serialized by the data layer.
+ * Server - WebSocket hub state.
+ *
+ * wsServer      IXWebSocket server object (owns listener + per-client threads).
+ * collection    Canonical movie collection.  All mutations use the data-layer
+ *               helpers which serialise internally.
+ * clients       Map from IXWebSocket connection-id string to raw WebSocket
+ *               pointer.  The pointer is valid for the lifetime of the
+ *               connection; it is inserted on Open and erased on Close.
+ *               Access must be guarded by clientsMutex.
+ * nextSessionId Monotonic id counter assigned to each new connection.
+ * persistencePath  If non-empty, the collection is auto-saved here.
+ * dirty         Flags that a save is needed; the persistence thread clears it.
  */
 struct Server {
-    boost::asio::io_context ioContext;
-    std::unique_ptr<boost::asio::ip::tcp::acceptor> acceptor;
+    std::unique_ptr<ix::WebSocketServer> wsServer;
     data::Collection collection;
-
-    std::vector<std::shared_ptr<Session>> sessions;
-    std::mutex sessionsMutex;
-    std::uint64_t nextSessionId = 1;
-
-    std::thread acceptorThread;
     std::atomic<bool> running{false};
+
+    std::mutex clientsMutex;
+    std::map<std::string, ix::WebSocket*> clients;
+    std::uint64_t nextSessionId = 1;
 
     std::string persistencePath;
     std::atomic<bool> dirty{false};
@@ -66,73 +66,80 @@ struct Server {
 };
 
 /**
- * Client - WebSocket client state. Owns the asio io_context, the socket
- * and a background reader thread that buffers incoming messages.
+ * Client - WebSocket client state for the desktop GUI.
+ *
+ * ws            IXWebSocket client object (owns its I/O thread).
+ * inbox         Buffered inbound text frames; drained by the UI thread each
+ *               render frame via drainInbox().
+ * connected     true after the Open event, false after Close or Error.
+ * connectCv     Condition variable used in connectClient() to block until
+ *               the handshake succeeds or the timeout expires.
+ * sessionId     Session id assigned by the first HELLO frame from the server.
  */
 struct Client {
-    boost::asio::io_context ioContext;
-    std::unique_ptr<boost::beast::websocket::stream<boost::beast::tcp_stream>> stream;
-    std::thread readerThread;
-    std::mutex writeMutex;
+    std::unique_ptr<ix::WebSocket> ws;
 
     std::mutex inboxMutex;
     std::deque<std::string> inbox;
 
     std::atomic<bool> connected{false};
-    std::atomic<bool> running{false};
     std::string lastError;
     std::mutex errorMutex;
 
+    std::mutex connectMutex;
+    std::condition_variable connectCv;
+
     std::uint64_t sessionId = 0;
+    std::atomic<bool> running{false};
 };
 
 /**
- * startServer - binds to the given port and begins accepting WebSocket
- * clients in the background. Returns once the acceptor is listening.
+ * startServer - binds to the given port, registers the per-client message
+ * callback, and begins accepting WebSocket clients.  Returns once the
+ * server is listening.
  *
  * @param server           Target server state (mutated).
  * @param port             TCP port number to listen on.
- * @param persistencePath  Optional JSON file to autosave the collection
- *                         on every change. Pass an empty string to skip.
- * @return true on success, false if binding failed.
+ * @param persistencePath  Optional JSON file to autosave on every change.
+ * @return true on success.
  */
 bool startServer(Server& server, std::uint16_t port, const std::string& persistencePath);
 
 /**
- * stopServer - gracefully shuts down the server and all sessions.
+ * stopServer - gracefully shuts down all sessions and the listener.
  *
  * @param server Target server.
  */
 void stopServer(Server& server);
 
 /**
- * broadcastMessage - pushes a single encoded frame to every live session.
- * Failed sends mark the session as dead; the janitor will reap it.
+ * broadcastMessage - sends a text frame to every currently-connected client.
  *
- * @param server Source server.
- * @param text   Encoded JSON frame.
+ * @param server  Source server.
+ * @param text    Encoded JSON frame.
  */
 void broadcastMessage(Server& server, const std::string& text);
 
 /**
- * connectClient - performs the WebSocket handshake to the given host/port.
+ * connectClient - starts the WebSocket client and blocks until the handshake
+ * completes (or a 5-second timeout fires).
  *
  * @param client Target client state.
  * @param host   Hostname or IP of the server.
- * @param port   Port string (Asio resolver convention).
- * @return true on success; populate client.lastError otherwise.
+ * @param port   Port string.
+ * @return true on success; client.lastError is populated on failure.
  */
 bool connectClient(Client& client, const std::string& host, const std::string& port);
 
 /**
- * disconnectClient - closes the socket and joins the reader thread.
+ * disconnectClient - closes the socket and resets client state.
  *
  * @param client Target client.
  */
 void disconnectClient(Client& client);
 
 /**
- * sendClientMessage - transmits a single frame to the server.
+ * sendClientMessage - transmits a single text frame to the server.
  *
  * @param client Target client.
  * @param text   Encoded JSON frame.
@@ -141,8 +148,7 @@ void disconnectClient(Client& client);
 bool sendClientMessage(Client& client, const std::string& text);
 
 /**
- * drainInbox - atomically moves every buffered inbound frame out of the
- * client and returns them to the caller (typically the GUI thread).
+ * drainInbox - atomically moves every buffered inbound frame to the caller.
  *
  * @param client Source client.
  * @return Zero or more JSON strings in arrival order.
@@ -150,8 +156,7 @@ bool sendClientMessage(Client& client, const std::string& text);
 std::vector<std::string> drainInbox(Client& client);
 
 /**
- * lastClientError - retrieves the latest error string captured by the
- * reader thread, if any.
+ * lastClientError - returns the latest error captured by the I/O thread.
  *
  * @param client Source client.
  * @return Error text (possibly empty).

@@ -7,6 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
     add_compile_options(/W4 /permissive-)
+    # Suppress warnings from third-party headers
+    add_compile_options(/external:anglebrackets /external:W0)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -24,9 +26,20 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 # ---------------------------------------------------------------------------
-# Boost (Asio + Beast for the WebSocket server/client)
+# IXWebSocket - header-friendly WebSocket server + client.
+# We disable TLS so there are no OpenSSL / mbedTLS prerequisites.
 # ---------------------------------------------------------------------------
-find_package(Boost 1.75 REQUIRED COMPONENTS system)
+set(USE_TLS         OFF CACHE BOOL "" FORCE)
+set(USE_OPEN_SSL    OFF CACHE BOOL "" FORCE)
+set(USE_MBED_TLS    OFF CACHE BOOL "" FORCE)
+set(USE_WS          OFF CACHE BOOL "" FORCE)
+set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    ixwebsocket
+    GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+    GIT_TAG        v11.4.5
+)
+FetchContent_MakeAvailable(ixwebsocket)
 
 # ---------------------------------------------------------------------------
 # Dear ImGui + GLFW + OpenGL (presentation layer)
@@ -44,8 +57,8 @@ if(MCM_BUILD_CLIENT)
             GIT_REPOSITORY https://github.com/glfw/glfw.git
             GIT_TAG        3.4
         )
-        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
         set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
         FetchContent_MakeAvailable(glfw)
     endif()
@@ -57,7 +70,7 @@ if(MCM_BUILD_CLIENT)
     )
     FetchContent_MakeAvailable(imgui)
 
-    add_library(imgui STATIC
+    add_library(imgui_lib STATIC
         ${imgui_SOURCE_DIR}/imgui.cpp
         ${imgui_SOURCE_DIR}/imgui_draw.cpp
         ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -66,11 +79,11 @@ if(MCM_BUILD_CLIENT)
         ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
         ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     )
-    target_include_directories(imgui PUBLIC
+    target_include_directories(imgui_lib PUBLIC
         ${imgui_SOURCE_DIR}
         ${imgui_SOURCE_DIR}/backends
     )
-    target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
+    target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
     set(IMGUI_AVAILABLE TRUE)
 endif()
 
@@ -93,14 +106,16 @@ add_executable(mcm ${MCM_SOURCES})
 target_include_directories(mcm PRIVATE include)
 target_link_libraries(mcm PRIVATE
     nlohmann_json::nlohmann_json
-    Boost::system
+    ixwebsocket
 )
 
 if(IMGUI_AVAILABLE)
-    target_link_libraries(mcm PRIVATE imgui)
+    target_link_libraries(mcm PRIVATE imgui_lib)
     target_compile_definitions(mcm PRIVATE MCM_HAS_IMGUI=1)
 endif()
 
-if(UNIX AND NOT APPLE)
+if(WIN32)
+    target_link_libraries(mcm PRIVATE ws2_32 mswsock)
+elseif(UNIX AND NOT APPLE)
     target_link_libraries(mcm PRIVATE pthread)
 endif()
