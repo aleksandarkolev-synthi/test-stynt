@@ -4,6 +4,12 @@
  * Uses GLFW + OpenGL3 backend. All ImGui interaction is expressed with
  * free functions operating on the UiState struct; no classes defined.
  */
+// Must come before any header that pulls in windows.h
+#if defined(_WIN32)
+#  define NOMINMAX
+#  define WIN32_LEAN_AND_MEAN
+#endif
+
 #include "presentation.h"
 
 #include <algorithm>

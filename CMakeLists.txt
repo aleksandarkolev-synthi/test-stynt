@@ -116,6 +116,11 @@ if(IMGUI_AVAILABLE)
 endif()
 
 if(WIN32)
+    # Prevent windows.h from defining min/max macros that clash with std::min/max
+    target_compile_definitions(mcm PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+if(WIN32)
     target_link_libraries(mcm PRIVATE ws2_32 mswsock)
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(mcm PRIVATE pthread)
