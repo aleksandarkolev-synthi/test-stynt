@@ -29,11 +29,12 @@ FetchContent_MakeAvailable(nlohmann_json)
 # IXWebSocket - header-friendly WebSocket server + client.
 # We disable TLS so there are no OpenSSL / mbedTLS prerequisites.
 # ---------------------------------------------------------------------------
-set(USE_TLS         OFF CACHE BOOL "" FORCE)
-set(USE_OPEN_SSL    OFF CACHE BOOL "" FORCE)
-set(USE_MBED_TLS    OFF CACHE BOOL "" FORCE)
-set(USE_WS          OFF CACHE BOOL "" FORCE)
-set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
+set(USE_TLS              OFF CACHE BOOL "" FORCE)
+set(USE_OPEN_SSL         OFF CACHE BOOL "" FORCE)
+set(USE_MBED_TLS         OFF CACHE BOOL "" FORCE)
+set(USE_WS               OFF CACHE BOOL "" FORCE)
+set(USE_ZLIB             OFF CACHE BOOL "" FORCE)  # disables per-message deflate
+set(IXWEBSOCKET_INSTALL  OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     ixwebsocket
     GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
